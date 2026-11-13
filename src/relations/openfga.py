@@ -132,11 +132,53 @@ class OpenFGA(framework.Object):
             return
 
         try:
-            self.charm._state.openfga = self._openfga_state_from_store_info(info)
+            openfga = self.charm._state.openfga
+            auth_model_id = (
+                openfga.get("auth_model_id") if openfga and openfga.get("store_id") == info.store_id else None
+            )
+            self.charm._state.openfga = self._openfga_state_from_store_info(info, auth_model_id)
         except ValueError as exc:
             logger.error("invalid OpenFGA store info: %s", exc)
 
         self.charm._update(event)
+
+    def discover_authorization_model(self) -> bool:
+        """Pin the newest existing model when authorization has no model yet.
+
+        Returns:
+            True if an authorization model ID was saved to peer state.
+        """
+        if not self.charm.unit.is_leader() or not self.charm.config["auth-enabled"] or not self.charm._state.is_ready():
+            return False
+
+        openfga = self.charm._state.openfga
+        if not openfga or openfga.get("auth_model_id"):
+            return False
+        if not openfga.get("full_http_url") or not openfga.get("store_id") or openfga.get("token") is None:
+            return False
+
+        url = f"{openfga['full_http_url']}/stores/{openfga['store_id']}/authorization-models"
+        try:
+            response = requests.get(url, headers=_build_headers(openfga), params={"page_size": 1}, timeout=10)
+            response.raise_for_status()
+            data = response.json()
+        except (RequestException, ValueError) as exc:
+            logger.warning("failed to discover OpenFGA authorization model: %s", exc)
+            return False
+
+        models = data.get("authorization_models") if isinstance(data, dict) else None
+        if not isinstance(models, list):
+            logger.warning("failed to discover OpenFGA authorization model: invalid authorization_models list")
+        elif not models:
+            logger.info("no authorization models found in OpenFGA store %s", openfga["store_id"])
+        else:
+            model_id = models[0].get("id") if isinstance(models[0], dict) else None
+            if isinstance(model_id, str) and model_id.strip():
+                self.charm._state.openfga = {**openfga, "auth_model_id": model_id}
+                logger.info("adopted existing OpenFGA authorization model %s", model_id)
+                return True
+            logger.warning("failed to discover OpenFGA authorization model: missing authorization model ID")
+        return False
 
     def _openfga_state_from_store_info(self, info, auth_model_id=None):
         """Build peer OpenFGA state from live store info.

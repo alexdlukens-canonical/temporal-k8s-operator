@@ -13,8 +13,17 @@ import unittest.mock
 import ops
 import ops.testing
 import pytest
+from requests.exceptions import HTTPError, Timeout
 
 from relations.openfga import _get_ofga_client
+
+
+@pytest.fixture(autouse=True)
+def read_authorization_models():
+    """Keep model discovery offline unless a test supplies a response."""
+    with unittest.mock.patch("relations.openfga.requests.get") as mock_get:
+        mock_get.return_value.json.return_value = {"authorization_models": []}
+        yield mock_get
 
 
 @pytest.fixture
@@ -244,6 +253,192 @@ def _with_openfga_http_url(state, openfga_data, http_api_url):
     relations = [rel for rel in state.relations if rel.endpoint != "openfga"]
     relations.append(openfga_relation)
     return dataclasses.replace(state, relations=relations)
+
+
+@pytest.mark.parametrize("event_name", ["config_changed", "update_status", "upgrade_charm", "relation_changed"])
+@unittest.mock.patch("socket.gethostbyname", return_value="127.0.0.1")
+def test_discovers_external_authorization_model(
+    mock_dns,
+    context,
+    action_state,
+    read_authorization_models,
+    event_name,
+    openfga_store_id,
+    openfga_data,
+    temporal_container_initialized,
+):
+    """Discover, persist, and configure an external model through lifecycle hooks."""
+    peer = action_state.get_relations("peer")[0]
+    openfga = json.loads(peer.local_app_data["openfga"])
+    openfga.update(
+        auth_model_id=None,
+        full_http_url="https://openfga.example.com/prefix",
+        token="openfga_token",
+    )
+    state = _with_peer_openfga(action_state, openfga)
+    if event_name == "update_status":
+        state = dataclasses.replace(state, unit_status=ops.BlockedStatus("missing openfga authorization model"))
+    read_authorization_models.return_value.json.return_value = {"authorization_models": [{"id": "external-model"}]}
+
+    if event_name == "relation_changed":
+        state = _with_openfga_http_url(
+            state,
+            openfga_data,
+            "https://openfga.example.com/prefix",
+        )
+        event = context.on.relation_changed(state.get_relations("openfga")[0])
+    else:
+        event = getattr(context.on, event_name)()
+    state_out = context.run(event, state)
+
+    read_authorization_models.assert_called_once_with(
+        f"https://openfga.example.com/prefix/stores/{openfga_store_id}/authorization-models",
+        headers={"Content-Type": "application/json", "Authorization": "Bearer openfga_token"},
+        params={"page_size": 1},
+        timeout=10,
+    )
+    saved = json.loads(state_out.get_relations("peer")[0].local_app_data["openfga"])
+    assert saved["auth_model_id"] == "external-model"
+    assert state_out.unit_status == ops.MaintenanceStatus("replanning application")
+    environment = state_out.get_container("temporal").plan.services["temporal-server"].environment
+    assert environment["OFGA_AUTH_MODEL_ID"] == "external-model"
+
+    state_out = dataclasses.replace(state_out, containers=[temporal_container_initialized])
+    with (
+        unittest.mock.patch("charm.TemporalK8SCharm._validate_pebble_plan", return_value=True),
+        unittest.mock.patch("charm.TemporalK8SCharm._server_running", return_value=True),
+    ):
+        state_out = context.run(context.on.update_status(), state_out)
+
+    assert state_out.unit_status == ops.ActiveStatus("auth enabled")
+    assert read_authorization_models.call_count == 1
+
+
+@pytest.mark.parametrize("event_name", ["config_changed", "update_status", "relation_changed"])
+@unittest.mock.patch("socket.gethostbyname", return_value="127.0.0.1")
+def test_existing_authorization_model_stays_pinned(
+    mock_dns, context, action_state, read_authorization_models, event_name
+):
+    """Keep the saved model even when relation data is refreshed."""
+    if event_name == "relation_changed":
+        event = context.on.relation_changed(action_state.get_relations("openfga")[0])
+    else:
+        event = getattr(context.on, event_name)()
+
+    state_out = context.run(event, action_state)
+
+    read_authorization_models.assert_not_called()
+    saved = json.loads(state_out.get_relations("peer")[0].local_app_data["openfga"])
+    assert saved["auth_model_id"] == "123"
+
+
+@pytest.mark.parametrize(
+    "response_data",
+    [
+        {"authorization_models": []},
+        {},
+        [],
+        {"authorization_models": None},
+        {"authorization_models": {}},
+        {"authorization_models": [{}]},
+        {"authorization_models": [None]},
+        {"authorization_models": [{"id": ""}]},
+        {"authorization_models": [{"id": 123}]},
+    ],
+)
+def test_missing_or_invalid_models_remain_blocked(
+    context, action_state, read_authorization_models, response_data, caplog
+):
+    """Never adopt an empty or malformed model listing."""
+    peer = action_state.get_relations("peer")[0]
+    openfga = json.loads(peer.local_app_data["openfga"])
+    openfga["auth_model_id"] = None
+    state = _with_peer_openfga(action_state, openfga)
+    read_authorization_models.return_value.json.return_value = response_data
+
+    state_out = context.run(context.on.config_changed(), state)
+
+    assert state_out.unit_status == ops.BlockedStatus("missing openfga authorization model")
+    assert json.loads(state_out.get_relations("peer")[0].local_app_data["openfga"]) == openfga
+    if response_data != {"authorization_models": []}:
+        assert "failed to discover OpenFGA authorization model" in caplog.text
+
+
+@pytest.mark.parametrize("failure", ["timeout", "http", "json"])
+@unittest.mock.patch("socket.gethostbyname", return_value="127.0.0.1")
+def test_discovery_errors_are_logged_and_retried(
+    mock_dns, context, action_state, read_authorization_models, failure, caplog
+):
+    """Retry discovery failures without overwriting peer state."""
+    peer = action_state.get_relations("peer")[0]
+    openfga = json.loads(peer.local_app_data["openfga"])
+    openfga["auth_model_id"] = None
+    state = _with_peer_openfga(action_state, openfga)
+    if failure == "timeout":
+        read_authorization_models.side_effect = Timeout("request timed out")
+    elif failure == "http":
+        read_authorization_models.return_value.raise_for_status.side_effect = HTTPError("403 Forbidden")
+    else:
+        read_authorization_models.return_value.json.side_effect = ValueError("invalid JSON")
+
+    state_out = context.run(context.on.config_changed(), state)
+
+    assert state_out.unit_status == ops.BlockedStatus("missing openfga authorization model")
+    assert json.loads(state_out.get_relations("peer")[0].local_app_data["openfga"]) == openfga
+    assert "failed to discover OpenFGA authorization model" in caplog.text
+
+    read_authorization_models.side_effect = None
+    read_authorization_models.return_value.raise_for_status.side_effect = None
+    read_authorization_models.return_value.json.side_effect = None
+    read_authorization_models.return_value.json.return_value = {"authorization_models": [{"id": "external-model"}]}
+
+    state_out = context.run(context.on.update_status(), state_out)
+
+    assert json.loads(state_out.get_relations("peer")[0].local_app_data["openfga"])["auth_model_id"] == "external-model"
+    assert state_out.unit_status == ops.MaintenanceStatus("replanning application")
+
+
+@pytest.mark.parametrize("skip_reason", ["follower", "auth_disabled", "no_peer", "no_store", "no_url", "no_token"])
+def test_discovery_requires_leader_and_ready_authorization(
+    context, action_state, read_authorization_models, skip_reason
+):
+    """Avoid requests or peer writes when discovery prerequisites are missing."""
+    peer = action_state.get_relations("peer")[0]
+    openfga = json.loads(peer.local_app_data["openfga"])
+    openfga["auth_model_id"] = None
+    if skip_reason in ("no_store", "no_url", "no_token"):
+        key = {"no_store": "store_id", "no_url": "full_http_url", "no_token": "token"}[skip_reason]
+        openfga[key] = None
+    state = _with_peer_openfga(action_state, openfga)
+    if skip_reason == "follower":
+        state = dataclasses.replace(state, leader=False)
+    elif skip_reason == "auth_disabled":
+        state = dataclasses.replace(state, config={"num-history-shards": 1})
+    elif skip_reason == "no_peer":
+        state = dataclasses.replace(state, relations=[rel for rel in state.relations if rel.endpoint != "peer"])
+
+    context.run(context.on.config_changed(), state)
+
+    read_authorization_models.assert_not_called()
+
+
+@unittest.mock.patch("socket.gethostbyname", return_value="127.0.0.1")
+def test_store_change_discards_old_model(mock_dns, context, action_state, read_authorization_models):
+    """Never reuse an authorization model ID from another store."""
+    relation = action_state.get_relations("openfga")[0]
+    relation = dataclasses.replace(relation, remote_app_data={**relation.remote_app_data, "store_id": "new-store"})
+    state = dataclasses.replace(
+        action_state,
+        relations=[rel for rel in action_state.relations if rel.endpoint != "openfga"] + [relation],
+    )
+    read_authorization_models.return_value.json.return_value = {"authorization_models": [{"id": "new-model"}]}
+
+    state_out = context.run(context.on.relation_changed(relation), state)
+
+    saved = json.loads(state_out.get_relations("peer")[0].local_app_data["openfga"])
+    assert saved["store_id"] == "new-store"
+    assert saved["auth_model_id"] == "new-model"
+    assert read_authorization_models.call_args.args[0].endswith("/stores/new-store/authorization-models")
 
 
 def _legacy_openfga_state(openfga_store_id, port=None):

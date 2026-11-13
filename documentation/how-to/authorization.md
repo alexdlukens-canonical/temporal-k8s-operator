@@ -110,6 +110,19 @@ running the following command:
 juju run temporal-k8s/0 create-authorization-model  model="$(<temporal_auth_model.json)" --string-args=true
 ```
 
+Alternatively, create a compatible authorization model directly in the related
+OpenFGA store using the OpenFGA API or external tooling. When authorization is
+enabled and no model ID is saved, the leader discovers the newest model in that
+store and shares its ID with the other units. Discovery runs during configuration
+updates and periodic `update-status` hooks, so a model created after the charm
+becomes blocked is detected without running the Juju action.
+
+Once selected, the model ID stays pinned, including across relation data updates
+for the same store. Newer models created externally are not automatically adopted.
+Connecting a different store clears the saved model ID and allows discovery in
+that store. If no model exists or discovery fails, the charm remains blocked;
+discovery failures are logged and retried on subsequent hooks.
+
 Wait until the charm has settled - when ready, `juju status --relations` will
 show:
 

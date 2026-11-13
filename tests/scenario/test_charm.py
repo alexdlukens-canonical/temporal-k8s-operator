@@ -1245,9 +1245,11 @@ def test_blocked_by_openfga_store(
 
 @pytest.mark.openfga_auth_skipped
 @pytest.mark.parametrize_skip_if(lambda leader: not leader)
+@unittest.mock.patch("relations.openfga.requests.get")
 def test_blocked_by_authorization_model(
-    context, state, temporal_container, temporal_container_initialized, admin_relation, openfga_relation
+    mock_get, context, state, temporal_container, temporal_container_initialized, admin_relation, openfga_relation
 ):
+    mock_get.return_value.json.return_value = {"authorization_models": []}
     state_out = context.run(context.on.pebble_ready(temporal_container), state)
     state_out = dataclasses.replace(state_out, containers=[temporal_container_initialized])
     state_out = context.run(context.on.relation_changed(admin_relation), state_out)

@@ -533,13 +533,15 @@ class TemporalK8SCharm(CharmBase):
         Args:
             event: The `update-status` event triggered at intervals.
         """
+        authorization_model_discovered = self.openfga_relation.discover_authorization_model()
+
         try:
             self._validate()
         except ValueError:
             return
 
         should_update = self.postgresql.update_db_relation_data_in_state(event)
-        if should_update:
+        if should_update or authorization_model_discovered:
             self._update(event)
             return
 
@@ -762,6 +764,8 @@ class TemporalK8SCharm(CharmBase):
         if self.app.planned_units() == 0:
             logger.info("application is being removed, skipping temporal configuration")
             return
+
+        self.openfga_relation.discover_authorization_model()
 
         try:
             self._validate()
